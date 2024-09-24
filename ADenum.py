@@ -14,7 +14,12 @@ def parse_nessus_csv(file_path):
     smb_hosts = df[df['Port'] == 445]['Host'].unique()
     smb_not_signed_ips = df[df['Name'].str.contains('SMB Signing not required', na=False)]['Host'].unique()
     
-    return dns_servers, kerberos_servers, ldap_servers, smb_hosts, smb_not_signed_ips
+    # Find hosts that have both port 445 and 443 open
+    hosts_with_443 = df[df['Port'] == 443]['Host'].unique()
+    hosts_with_445_and_443 = list(set(smb_hosts) & set(hosts_with_443)) 
+
+    return dns_servers, kerberos_servers, ldap_servers, smb_hosts, smb_not_signed_ips, hosts_with_445_and_443
+
 
 def save_smb_not_signed_ips(smb_not_signed_ips, output_dir):
     print("Saving SMB not signed IPs to file...")
@@ -141,32 +146,59 @@ def generate_html_report(dns_servers, kerberos_servers, ldap_servers, domains, d
     with open(output_file, 'w') as f:
         f.write(html_content)
     
-def display_output(dns_servers, kerberos_servers, ldap_servers, domains, domain_controllers):
-    print("\nDisplaying results...")
-    print("\nDNS Servers:")
-    for server in dns_servers:
-        print(f" - {server}")
-    
-    print("\nKerberos Servers:")
-    for server in kerberos_servers:
-        print(f" - {server}")
-    
-    print("\nLDAP Servers:")
-    for server in ldap_servers:
-        print(f" - {server}")
+def display_table(headers, rows):
+    # Calculate the width for each column based on the longest item in each column
+    col_widths = [max(len(str(item)) for item in col) for col in zip(*([headers] + rows))]
 
-    print("\nDomains:")
-    for domain in domains:
-        print(f" - {domain}")
-    
-    print("\nDomain Controllers:")
-    for dc in domain_controllers:
-        print(f" - {dc}")
-    
+    # Create the horizontal separator
+    separator = '+' + '+'.join(['-' * (width + 2) for width in col_widths]) + '+'
+
+    # Function to format a row with borders
+    def format_row(row):
+        return '| ' + ' | '.join([f"{str(item).ljust(width)}" for item, width in zip(row, col_widths)]) + ' |'
+
+    # Print the table
+    print(separator)
+    print(format_row(headers))
+    print(separator)
+    for row in rows:
+        print(format_row(row))
+    print(separator)
+
+
+def display_output(dns_servers, kerberos_servers, ldap_servers, domains, domain_controllers):
+    print("\nDisplaying results...\n")
+
+    # Display DNS Servers table
+    if dns_servers.size > 0:
+        display_table(['DNS Servers'], [[server] for server in dns_servers])
     print()
 
+    # Display Kerberos Servers table
+    if kerberos_servers.size > 0:
+        display_table(['Kerberos Servers'], [[server] for server in kerberos_servers])
+    print()
+
+    # Display LDAP Servers table
+    if ldap_servers.size > 0:
+        display_table(['LDAP Servers'], [[server] for server in ldap_servers])
+    print()
+
+    # Display Domains table
+    if len(domains) > 0:  # domains is likely a regular list, so len() works here
+        display_table(['Domain Names'], [[domain] for domain in domains])
+    print()
+
+    # Display Domain Controllers table
+    if len(domain_controllers) > 0:  # domain_controllers is also likely a list
+        display_table(['Domain Controllers', 'IP Address'], [dc.split() for dc in domain_controllers])
+
+    print()
+
+
+
 def enumerate_domains(drone, smb_hosts):
-    print("Enumerating domains using crackmapexec...")
+    print("Enumerating domains...")
     remote_file_path = "/tmp/smb-ips.txt"
     with open("smb-ips.txt", "w") as file:
         file.write("\n".join(smb_hosts))
@@ -175,7 +207,7 @@ def enumerate_domains(drone, smb_hosts):
     os.remove("smb-ips.txt")
     
     cmd = (
-        f"crackmapexec smb {remote_file_path} | "
+        f"netexec smb {remote_file_path} | "
         f"awk -F'[() ]' '{{name=\"\"; domain=\"\"; for (i=1; i<=NF; i++) {{if ($i ~ /^name:/) name=substr($i,6); if ($i ~ /^domain:/) domain=substr($i,8);}} if (name != domain) print domain;}}' | "
         "sort | uniq"
     )
@@ -216,6 +248,34 @@ def query_dns_for_domain_controllers(drone, dns_servers, domains):
 
     return domain_controllers
 
+def check_adcs_enrollment_servers(drone, hosts_with_445_and_443):
+    print("Checking for ADCS Web Enrollment servers...")
+
+    adcs_servers = []
+    for host in hosts_with_445_and_443:
+        url = f"https://{host}/certsrv"
+        cmd = f"curl -k -s -o /dev/null -w '%{{http_code}}' {url}"
+
+        try:
+            response_code = drone.execute(cmd)
+            if response_code.strip() == "200":
+                print(f"ADCS Web Enrollment page found on: {host}")
+                adcs_servers.append(host)
+            else:
+                print(f"ADCS Web Enrollment page not found on: {host} (Status Code: {response_code})")
+        except Exception as e:
+            print(f"Error accessing {url} from the remote system: {e}")
+
+    if adcs_servers:
+        print("\nADCS Web Enrollment Servers found:")
+        for server in adcs_servers:
+            print(f" - {server}")
+    else:
+        print("\nNo ADCS Web Enrollment servers found.")
+    
+    return adcs_servers
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze Nessus CSV and enumerate basic info on Active Directory.")
     parser.add_argument("csv_file", help="Path to the Nessus CSV file.")
@@ -230,7 +290,7 @@ def main():
 
     output_dir = os.path.dirname(args.csv_file)
     
-    dns_servers, kerberos_servers, ldap_servers, smb_hosts, smb_not_signed_ips = parse_nessus_csv(args.csv_file)
+    dns_servers, kerberos_servers, ldap_servers, smb_hosts, smb_not_signed_ips, hosts_with_445_and_443 = parse_nessus_csv(args.csv_file)
     
     domains = []
     domain_controllers = []
@@ -238,7 +298,11 @@ def main():
         drone = Drone(args.hostname, args.username, args.password)
         domains = enumerate_domains(drone, smb_hosts)
         domain_controllers = query_dns_for_domain_controllers(drone, dns_servers, domains)
+
+        # Check for ADCS Web Enrollment servers from the remote system
+        adcs_servers = check_adcs_enrollment_servers(drone, hosts_with_445_and_443)
     
+    # Display the output in table format
     display_output(dns_servers, kerberos_servers, ldap_servers, domains, domain_controllers)
     
     if args.html:
