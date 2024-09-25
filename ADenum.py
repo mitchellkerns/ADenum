@@ -166,33 +166,31 @@ def display_table(headers, rows):
     print(separator)
 
 
-def display_output(dns_servers, kerberos_servers, ldap_servers, domains, domain_controllers):
+def display_output(dns_servers, kerberos_servers, ldap_servers, domains, ad_infrastructure):
     print("\nDisplaying results...\n")
+
+    # Display Domain Names table at the top
+    if len(domains) > 0:
+        display_table(['Domain Names'], [[domain] for domain in domains])
+    print()
 
     # Display DNS Servers table
     if dns_servers.size > 0:
         display_table(['DNS Servers'], [[server] for server in dns_servers])
     print()
 
-    # Display Kerberos Servers table
-    if kerberos_servers.size > 0:
-        display_table(['Kerberos Servers'], [[server] for server in kerberos_servers])
-    print()
-
-    # Display LDAP Servers table
-    if ldap_servers.size > 0:
-        display_table(['LDAP Servers'], [[server] for server in ldap_servers])
-    print()
-
-    # Display Domains table
-    if len(domains) > 0:  # domains is likely a regular list, so len() works here
-        display_table(['Domain Names'], [[domain] for domain in domains])
-    print()
-
-    # Display Domain Controllers table
-    if len(domain_controllers) > 0:  # domain_controllers is also likely a list
-        display_table(['Domain Controllers', 'IP Address'], [dc.split() for dc in domain_controllers])
-
+    # Display AD infrastructure components (Domain Controllers, ADCS, SQL, SCCM, Kerberos, etc.)
+    for component, servers in ad_infrastructure.items():
+        if len(servers) > 0:
+            # Check if the results contain both hostname and IP (space-separated), and split accordingly
+            if any(" " in server for server in servers):
+                # If space exists, split hostname and IP
+                display_table([f'{component}', 'IP Address'], [server.split(maxsplit=1) for server in servers])
+            else:
+                # Single-column data without hostname-IP pairs
+                display_table([f'{component}'], [[server] for server in servers])
+        else:
+            print(f"\nNo {component} found.")
     print()
 
 
@@ -242,38 +240,65 @@ def query_dns_for_domain_controllers(drone, dns_servers, domains):
                     if len(parts) >= 5 and "IN" in parts and "A" in parts:
                         hostname = parts[0].strip('.')
                         ip_address = parts[-1]
-                        domain_controllers.append(f"{hostname}     {ip_address}")
+                        domain_controllers.append(f"{hostname} {ip_address}")
                         
                     additional_section_found = False
 
     return domain_controllers
 
-def check_adcs_enrollment_servers(drone, hosts_with_445_and_443):
-    print("Checking for ADCS Web Enrollment servers...")
 
-    adcs_servers = []
-    for host in hosts_with_445_and_443:
-        url = f"https://{host}/certsrv"
-        cmd = f"curl -k -s -o /dev/null -w '%{{http_code}}' {url}"
-
-        try:
-            response_code = drone.execute(cmd)
-            if response_code.strip() == "200":
-                print(f"ADCS Web Enrollment page found on: {host}")
-                adcs_servers.append(host)
-            else:
-                print(f"ADCS Web Enrollment page not found on: {host} (Status Code: {response_code})")
-        except Exception as e:
-            print(f"Error accessing {url} from the remote system: {e}")
-
-    if adcs_servers:
-        print("\nADCS Web Enrollment Servers found:")
-        for server in adcs_servers:
-            print(f" - {server}")
-    else:
-        print("\nNo ADCS Web Enrollment servers found.")
+def query_dns_for_ad_infrastructure(drone, dns_servers, domains):
+    print("Querying DNS for AD infrastructure components...")
     
-    return adcs_servers
+    # Add new AD-related DNS queries
+    infrastructure = {
+        "Domain Controllers": "_ldap._tcp.dc._msdcs.",
+        "Global Catalog Servers": "_gc._tcp.",
+        "Kerberos Servers": "_kerberos._tcp.dc._msdcs.",
+        "AD Federation Services": "_adfs._tcp.",
+        "AD Lightweight Directory Services": "_ldap._tcp.",
+        "AD Rights Management Services": "_rms._tcp.",
+        "Device Health Attestation": "_dha._tcp.",
+        "DHCP Servers": "_dhcp._udp.",
+        "File and Storage Services": "_file._tcp.",
+        "Host Guardian Service": "_hgs._tcp.",
+        "Hyper-V": "_hyperv._tcp.",
+        "Print and Document Services": "_print._tcp.",
+        "Remote Access": "_remote._tcp.",
+        "Remote Desktop Services": "_rdp._tcp.",
+        "Volume Activation Services": "_vlmcs._tcp.",
+        "Web Server (IIS)": "_http._tcp.",
+        "Windows Server Update Services": "_wsus._tcp."
+    }
+
+    results = {}
+    
+    for service_name, srv_query in infrastructure.items():
+        results[service_name] = []
+        for dns_server in dns_servers:
+            for domain in domains:
+                query = f"dig @{dns_server} {srv_query}{domain} SRV"
+                dig_output = drone.execute(query)
+                lines = dig_output.splitlines()
+                
+                additional_section_found = False
+                
+                for line in lines:
+                    if ";; ADDITIONAL SECTION:" in line:
+                        additional_section_found = True
+                        continue
+                    
+                    if additional_section_found:
+                        parts = line.split()
+                        if len(parts) >= 5 and "IN" in parts and "A" in parts:
+                            hostname = parts[0].strip('.')
+                            ip_address = parts[-1]
+                            results[service_name].append(f"{hostname} {ip_address}")
+                            
+                        additional_section_found = False
+
+    return results
+
 
 
 def main():
@@ -293,21 +318,21 @@ def main():
     dns_servers, kerberos_servers, ldap_servers, smb_hosts, smb_not_signed_ips, hosts_with_445_and_443 = parse_nessus_csv(args.csv_file)
     
     domains = []
-    domain_controllers = []
+    ad_infrastructure = {}
+
     if args.hostname and args.username and args.password:
         drone = Drone(args.hostname, args.username, args.password)
         domains = enumerate_domains(drone, smb_hosts)
-        domain_controllers = query_dns_for_domain_controllers(drone, dns_servers, domains)
-
-        # Check for ADCS Web Enrollment servers from the remote system
-        adcs_servers = check_adcs_enrollment_servers(drone, hosts_with_445_and_443)
+        
+        # Query for AD infrastructure (Domain Controllers, ADCS, SQL, SCCM, etc.)
+        ad_infrastructure = query_dns_for_ad_infrastructure(drone, dns_servers, domains)
     
     # Display the output in table format
-    display_output(dns_servers, kerberos_servers, ldap_servers, domains, domain_controllers)
+    display_output(dns_servers, kerberos_servers, ldap_servers, domains, ad_infrastructure)
     
     if args.html:
         output_file = os.path.join(output_dir, "AD_Report.html")
-        generate_html_report(dns_servers, kerberos_servers, ldap_servers, domains, domain_controllers, smb_not_signed_ips, output_file)
+        generate_html_report(dns_servers, kerberos_servers, ldap_servers, domains, [], smb_not_signed_ips, output_file)
         print(f"HTML report generated: {output_file}")
 
     smb_not_signed_file = save_smb_not_signed_ips(smb_not_signed_ips, output_dir)
