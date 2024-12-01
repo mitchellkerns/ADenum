@@ -146,51 +146,78 @@ def generate_html_report(dns_servers, kerberos_servers, ldap_servers, domains, d
     with open(output_file, 'w') as f:
         f.write(html_content)
     
-def display_table(headers, rows):
+
+def display_table(headers, rows, service_separators):
+    """Helper function to display tables with properly adjusted separators."""
     # Calculate the width for each column based on the longest item in each column
     col_widths = [max(len(str(item)) for item in col) for col in zip(*([headers] + rows))]
 
-    # Create the horizontal separator
-    separator = '+' + '+'.join(['-' * (width + 2) for width in col_widths]) + '+'
+    # Function to create a separator line with dashes based on column width
+    def create_separator():
+        return '+' + '+'.join(['-' * (width + 2) for width in col_widths]) + '+'
 
     # Function to format a row with borders
     def format_row(row):
         return '| ' + ' | '.join([f"{str(item).ljust(width)}" for item, width in zip(row, col_widths)]) + ' |'
 
     # Print the table
-    print(separator)
+    print(create_separator())
     print(format_row(headers))
-    print(separator)
-    for row in rows:
+    print(create_separator())
+    for i, row in enumerate(rows):
         print(format_row(row))
-    print(separator)
+        # Add a separator if the current row index matches a service separator
+        if service_separators and (i + 1 in service_separators):
+            print(create_separator())
 
-
-def display_output(dns_servers, kerberos_servers, ldap_servers, domains, ad_infrastructure):
+def display_output(dns_servers, domains, ad_infrastructure):
     print("\nDisplaying results...\n")
 
-    # Display Domain Names table at the top
-    if len(domains) > 0:
-        display_table(['Domain Names'], [[domain] for domain in domains])
-    print()
-
-    # Display DNS Servers table
+    # Display DNS Servers separately as they are not domain-specific
     if dns_servers.size > 0:
-        display_table(['DNS Servers'], [[server] for server in dns_servers])
+        display_table(['DNS Servers'], [[server] for server in dns_servers], service_separators=[])
     print()
 
-    # Display AD infrastructure components (Domain Controllers, ADCS, SQL, SCCM, Kerberos, etc.)
-    for component, servers in ad_infrastructure.items():
-        if len(servers) > 0:
-            # Check if the results contain both hostname and IP (space-separated), and split accordingly
-            if any(" " in server for server in servers):
-                # If space exists, split hostname and IP
-                display_table([f'{component}', 'IP Address'], [server.split(maxsplit=1) for server in servers])
-            else:
-                # Single-column data without hostname-IP pairs
-                display_table([f'{component}'], [[server] for server in servers])
+    # Prepare the headers for the consolidated table (one for each domain)
+    domain_headers = ['Service/Component'] + domains
+    consolidated_rows = []
+    service_separators = []
+
+    for component, domain_results in ad_infrastructure.items():
+        service_rows = []
+
+        # Find unique entries for each domain and component to avoid duplicates
+        unique_results = {domain: list(set(domain_results[domain])) for domain in domains}
+
+        # Check if any domain has results for the current component
+        has_results = any(unique_results[domain] for domain in domains)
+
+        if has_results:
+            # Find the maximum number of entries across all domains for this component
+            max_entries = max(len(unique_results[domain]) for domain in domains)
+
+            for i in range(max_entries):
+                row = [component if i == 0 else '']  # Component name only for the first row
+
+                for domain in domains:
+                    if i < len(unique_results[domain]):
+                        row.append(unique_results[domain][i])
+                    else:
+                        row.append('')  # Empty space if no more entries
+
+                service_rows.append(row)
         else:
-            print(f"\nNo {component} found.")
+            # If no results were found for this component, mark as "N/A" only once
+            service_rows.append([component] + ['N/A'] * len(domains))
+
+        # Add the service rows to the final result
+        consolidated_rows.extend(service_rows)
+
+        # Mark where the divider should go
+        service_separators.append(len(consolidated_rows))  # Adds a separator after each service/component
+
+    # Display the consolidated table for all components across all domains
+    display_table(domain_headers, consolidated_rows, service_separators)
     print()
 
 
@@ -205,6 +232,7 @@ def enumerate_domains(drone, smb_hosts):
     os.remove("smb-ips.txt")
     
     cmd = (
+        #f"~/.local/bin/netexec smb {remote_file_path} | "
         f"netexec smb {remote_file_path} | "
         f"awk -F'[() ]' '{{name=\"\"; domain=\"\"; for (i=1; i<=NF; i++) {{if ($i ~ /^name:/) name=substr($i,6); if ($i ~ /^domain:/) domain=substr($i,8);}} if (name != domain) print domain;}}' | "
         "sort | uniq"
@@ -255,51 +283,61 @@ def query_dns_for_ad_infrastructure(drone, dns_servers, domains):
         "Domain Controllers": "_ldap._tcp.dc._msdcs.",
         "Global Catalog Servers": "_gc._tcp.",
         "Kerberos Servers": "_kerberos._tcp.dc._msdcs.",
-        "AD Federation Services": "_adfs._tcp.",
         "AD Lightweight Directory Services": "_ldap._tcp.",
         "AD Rights Management Services": "_rms._tcp.",
-        "Device Health Attestation": "_dha._tcp.",
-        "DHCP Servers": "_dhcp._udp.",
+        "Certificate Authorities": "_vlmcs._tcp.",
+        "SQL Servers": "_mssql._tcp.",
+        "Management Point (SCCM)": "_mps._tcp.",
+        "Distribution Point (SCCM)": "_msdp._tcp.",
+        "Web Server (IIS)": "_http._tcp.",
+        "Windows Server Update Services": "_wsus._tcp.",
+        "File Replication Service (FRS)": "_ldap._tcp.pdc._msdcs.",
         "File and Storage Services": "_file._tcp.",
         "Host Guardian Service": "_hgs._tcp.",
         "Hyper-V": "_hyperv._tcp.",
         "Print and Document Services": "_print._tcp.",
         "Remote Access": "_remote._tcp.",
+        "PDC Emulator (FRS)": "_ldap._tcp.pdc._msdcs.",
         "Remote Desktop Services": "_rdp._tcp.",
         "Volume Activation Services": "_vlmcs._tcp.",
-        "Web Server (IIS)": "_http._tcp.",
-        "Windows Server Update Services": "_wsus._tcp."
+        "Device Health Attestation": "_dha._tcp.",
+        "DHCP Servers": "_dhcp._udp."
     }
 
-    results = {}
-    
-    for service_name, srv_query in infrastructure.items():
-        results[service_name] = []
+    results = {component: {domain: [] for domain in domains} for component in infrastructure}
+
+    for component, srv_query in infrastructure.items():
         for dns_server in dns_servers:
             for domain in domains:
                 query = f"dig @{dns_server} {srv_query}{domain} SRV"
                 dig_output = drone.execute(query)
                 lines = dig_output.splitlines()
-                
+
                 additional_section_found = False
-                
+                current_hostnames = []
+                current_ips = []
+
                 for line in lines:
                     if ";; ADDITIONAL SECTION:" in line:
                         additional_section_found = True
                         continue
-                    
+
                     if additional_section_found:
                         parts = line.split()
                         if len(parts) >= 5 and "IN" in parts and "A" in parts:
                             hostname = parts[0].strip('.')
                             ip_address = parts[-1]
-                            results[service_name].append(f"{hostname} {ip_address}")
-                            
-                        additional_section_found = False
+                            current_hostnames.append(hostname)
+                            current_ips.append(ip_address)
+                
+                # Combine hostname and IPs in the format "IP / Hostname"
+                combined_results = [f"{ip} / {hostname}" for ip, hostname in zip(current_ips, current_hostnames)]
+                
+                # Ensure there is something to add
+                if combined_results:
+                    results[component][domain].extend(combined_results)
 
     return results
-
-
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze Nessus CSV and enumerate basic info on Active Directory.")
@@ -328,7 +366,7 @@ def main():
         ad_infrastructure = query_dns_for_ad_infrastructure(drone, dns_servers, domains)
     
     # Display the output in table format
-    display_output(dns_servers, kerberos_servers, ldap_servers, domains, ad_infrastructure)
+    display_output(dns_servers, domains, ad_infrastructure)
     
     if args.html:
         output_file = os.path.join(output_dir, "AD_Report.html")
@@ -337,6 +375,7 @@ def main():
 
     smb_not_signed_file = save_smb_not_signed_ips(smb_not_signed_ips, output_dir)
     print(f"Hosts with SMB signing not enabled saved to: {smb_not_signed_file}")
+
 
 if __name__ == "__main__":
     main()
